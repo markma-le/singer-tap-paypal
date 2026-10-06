@@ -60,3 +60,6 @@ singer-paypal/bin/tap-paypal --state state.json -c paypal_config.json | singer-j
 ```
 
 Copyright &copy; 2021 Yoast
+## Ledger fork
+
+This fork emits `transactions` for a bounded, exclusive-end reporting period. Configure `client_id`, `client_secret`, `account_id`, `merchant_id`, `start_date` and `end_date`; `sandbox` is optional. Merge records on the merchant-scoped `event_id`. Signed amounts, fees and original transaction fields are preserved. Completed-period state is emitted only after every page passes merchant, refresh and count validation.

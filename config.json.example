@@ -1,6 +1,9 @@
 {
   "client_id": "paypal_client_id",
-  "secret": "paypal_secret",
   "sandbox": false,
-  "start_date": "2021-01-01T00:00:00Z"
+  "start_date": "2021-01-01T00:00:00Z",
+  "client_secret": "paypal_secret",
+  "account_id": "LEAU",
+  "merchant_id": "paypal_merchant_id",
+  "end_date": "2021-01-02T00:00:00Z"
 }

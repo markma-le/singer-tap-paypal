@@ -2,16 +2,16 @@
 # -*- coding: utf-8 -*-
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
 from typing import Generator, Optional
 
 import httpx
 import singer
-from dateutil.parser import isoparse
 from dateutil.rrule import WEEKLY, rrule
 
-from tap_paypal.cleaners import clean_paypal_transactions
+from tap_paypal.ledger import timestamp, transaction_record
 
 # Todo: Sadbox
 API_SCHEME: str = 'https://'
@@ -36,6 +36,8 @@ class PayPal(object):  # noqa: WPS230
         client_id: str,
         secret: str,
         sandbox=False,
+        account_id=None,
+        merchant_id=None,
     ) -> None:
         """Initialize client.
 
@@ -47,6 +49,9 @@ class PayPal(object):  # noqa: WPS230
         self.client_id: str = client_id
         self.secret: str = secret
         self.sandbox: bool = sandbox
+        self.account_id = account_id
+        self.merchant_id = merchant_id
+        self.http = httpx.Client(http2=True, timeout=60)
         self.base: str = API_BASE_URL_SANDBOX if sandbox else API_BASE_URL
         self.logger: logging.Logger = singer.get_logger()
 
@@ -61,7 +66,7 @@ class PayPal(object):  # noqa: WPS230
         # Perform authentication during initialising
         self._authenticate()
 
-    def paypal_transactions(  # noqa: WPS210, WPS213
+    def transactions(  # noqa: WPS210, WPS213
         self,
         **kwargs: dict,
     ) -> Generator[dict, None, None]:
@@ -82,8 +87,10 @@ class PayPal(object):  # noqa: WPS230
             raise ValueError('The parameter start_date is required.')
 
         # Set start date and end date
-        start_date: datetime = isoparse(start_date_input)
-        end_date: datetime = datetime.now(timezone.utc).replace(microsecond=0)
+        start_date: datetime = timestamp(start_date_input, whole_seconds=True)
+        end_date: datetime = timestamp(kwargs.pop('end_date'), whole_seconds=True)
+        if start_date >= end_date:
+            raise ValueError('end_date must be later than start_date')
 
         self.logger.info(
             f'Retrieving transactions from {start_date} to {end_date}',
@@ -97,7 +104,7 @@ class PayPal(object):  # noqa: WPS230
         batches: rrule = rrule(
             WEEKLY,
             dtstart=start_date,
-            until=end_date,
+            until=end_date - timedelta(seconds=1),
         )
 
         total_batches: int = len(list(batches))
@@ -114,8 +121,8 @@ class PayPal(object):  # noqa: WPS230
             )
 
             # Prevent the end_date from going into the future
-            if end_date_batch > end_date:
-                end_date_batch = end_date
+            if end_date_batch >= end_date:
+                end_date_batch = end_date - timedelta(seconds=1)
 
             # Convert the datetimes to datetime formats the api expects
             start_date_str: str = self._date_to_paypal_format(start_date_batch)
@@ -130,8 +137,8 @@ class PayPal(object):  # noqa: WPS230
 
             # Default initial parameters send with each request
             fixed_params: dict = {
-                'fields': 'all',
-                'page_size': 100,
+                'fields': 'transaction_info',
+                'page_size': 500,
                 'page': 1,  # Is updated in further requests
                 'start_date': start_date_str,
                 'end_date': end_date_str,
@@ -142,6 +149,8 @@ class PayPal(object):  # noqa: WPS230
             # Start of pagination
             page: int = 0
             total_pages: int = 1
+            expected_total = None
+            seen = 0
             url: str = (
                 f'{API_SCHEME}{self.base}/'
                 f'{API_VERSION}/{API_PATH_TRANSACTIONS}'
@@ -154,8 +163,7 @@ class PayPal(object):  # noqa: WPS230
                 http_params['page'] = page
 
                 # Request data from the API
-                client: httpx.Client = httpx.Client(http2=True)
-                response: httpx._models.Response = client.get(  # noqa: WPS437
+                response: httpx.Response = self._request(  # noqa: WPS437
                     url,
                     headers=self.headers,
                     params=http_params,
@@ -167,10 +175,21 @@ class PayPal(object):  # noqa: WPS230
                 response_data: dict = response.json()
 
                 # Retrieve the current page details
-                page = response_data.get('page', 1)
-                total_pages = response_data.get('total_pages', 0)
+                if int(response_data['page']) != page:
+                    raise ValueError('Unexpected transaction page')
+                merchant_id = response_data['account_number']
+                if self.merchant_id is not None and merchant_id != self.merchant_id:
+                    raise ValueError('Reporting response belongs to a different merchant account')
+                self.merchant_id = merchant_id
+                if timestamp(response_data['last_refreshed_datetime']) < end_date_batch:
+                    raise ValueError('Transactions have not refreshed through requested end time')
+                total = int(response_data['total_items'])
+                if expected_total is not None and total != expected_total:
+                    raise ValueError('Transaction count changed during pagination; rerun')
+                expected_total = total
+                total_pages = int(response_data['total_pages'])
 
-                percentage_page: float = round((page / total_pages) * 100, 2)
+                percentage_page: float = round((page / max(total_pages, 1)) * 100, 2)
                 percentage_batch: float = round(
                     (current_batch / total_batches) * 100, 2,
                 )
@@ -189,14 +208,35 @@ class PayPal(object):  # noqa: WPS230
                     'transaction_details',
                     [],
                 )
+                seen += len(transactions)
                 yield from (
-                    clean_paypal_transactions(transaction)
+                    transaction_record(self.account_id, merchant_id, transaction)
                     for transaction in transactions
                 )
-                # for transaction in transactions:
-                #     yield clean_paypal_transactions(transaction)
-
+            if seen != expected_total:
+                raise ValueError('Transaction pages are incomplete')
         self.logger.info('Finished: paypal_transactions')
+
+    def _request(self, url, **kwargs):
+        for attempt in range(5):
+            if datetime.now(timezone.utc) >= self.token_expires:
+                self._authenticate()
+                kwargs['headers'] = self.headers
+            try:
+                response = self.http.get(url, **kwargs)
+                if response.status_code == 401 and attempt < 4:
+                    self._authenticate()
+                    kwargs['headers'] = self.headers
+                    continue
+                if (response.status_code == 429 or response.status_code >= 500) and attempt < 4:
+                    time.sleep(2 ** attempt)
+                    continue
+                response.raise_for_status()
+                return response
+            except httpx.RequestError:
+                if attempt == 4:
+                    raise RuntimeError('PayPal network request failed') from None
+                time.sleep(2 ** attempt)
 
     def _authenticate(self) -> None:  # noqa: WPS210
         """Generate a bearer access token."""
@@ -210,10 +250,9 @@ class PayPal(object):  # noqa: WPS230
         }
         post_data: dict = {'grant_type': 'client_credentials'}
 
-        now: datetime = datetime.utcnow()
+        now: datetime = datetime.now(timezone.utc)
 
-        client: httpx.Client = httpx.Client(http2=True)
-        response: httpx._models.Response = client.post(  # noqa: WPS437
+        response: httpx.Response = self.http.post(  # noqa: WPS437
             url,
             headers=headers,
             data=post_data,
@@ -230,7 +269,7 @@ class PayPal(object):  # noqa: WPS230
 
         # Set experation date for token
         expires_in: int = response_data.get('expires_in', 0)
-        self.token_expires = now + timedelta(expires_in)
+        self.token_expires = now + timedelta(seconds=max(0, expires_in - 60))
 
         # Set up headers to use in API requests
         self._create_headers()
@@ -260,4 +299,4 @@ class PayPal(object):  # noqa: WPS230
         Returns:
             str -- Converted datetime: 2021-01-01T00:00:00+0000
         """
-        return ''.join(input_datetime.isoformat().rsplit(':', 1))
+        return input_datetime.isoformat()

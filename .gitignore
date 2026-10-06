@@ -112,3 +112,5 @@ state.json
 
 # Config
 test_paypal_config.json
+.venv/
+.pytest_cache/

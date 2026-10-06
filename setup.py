@@ -11,7 +11,7 @@ setup(
     classifiers=['Programming Language :: Python :: 3 :: Only'],
     py_modules=['tap_paypal'],
     install_requires=[
-        'httpx[http2]~=0.16.1',
+        'httpx[http2]>=0.28,<0.29',
         'python-dateutil~=2.8.1',
         'singer-python~=5.10.0',
     ],
